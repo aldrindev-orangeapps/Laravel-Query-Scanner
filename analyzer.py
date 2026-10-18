@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-SCANNER_VERSION = "0.1.0"
+SCANNER_VERSION = "0.2.0"
 QUERY_TERMINALS = (
     "get", "first", "firstOrFail", "find", "findOrFail", "value", "pluck",
     "count", "exists", "doesntExist", "sum", "avg", "min", "max", "paginate",
@@ -212,6 +212,25 @@ def discover_relationships(project_root: Path) -> Tuple[Set[str], Dict[str, List
     return relationships, by_model, digest.hexdigest()
 
 
+def discover_model_classes(project_root: Path) -> Set[str]:
+    """Return locally declared Eloquent model class names."""
+    classes: Set[str] = set()
+    app_dir = project_root / "app"
+    if not app_dir.is_dir():
+        return classes
+    pattern = re.compile(
+        r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\s+extends\s+"
+        r"(?:\\?[A-Za-z_][A-Za-z0-9_\\]*\\)?(?:Model|Authenticatable|Pivot)\b"
+    )
+    for path in app_dir.rglob("*.php"):
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        classes.update(pattern.findall(mask_php(source)))
+    return classes
+
+
 def _statement_snippet(source: str, offset: int) -> str:
     start = source.rfind("\n", 0, offset) + 1
     end = source.find("\n", offset)
@@ -223,7 +242,9 @@ def _statement_snippet(source: str, offset: int) -> str:
 def _query_pattern() -> re.Pattern[str]:
     terminals = "|".join(re.escape(name) for name in QUERY_TERMINALS)
     return re.compile(
-        r"(?:\\?[A-Z][A-Za-z0-9_\\]*\s*::|\$[A-Za-z_][A-Za-z0-9_]*\s*->)"
+        r"(?:\\?[A-Z][A-Za-z0-9_\\]*\s*::|"
+        r"\$this\s*->\s*[A-Za-z_][A-Za-z0-9_]*\s*::|"
+        r"\$[A-Za-z_][A-Za-z0-9_]*\s*->\s*(?=[A-Za-z_][A-Za-z0-9_]*\s*\())"
         r"(?:(?!;|\{\{|\?>).){0,1200}?"
         r"(?:->|::)(?:" + terminals + r")\s*\(",
         re.DOTALL,
@@ -233,20 +254,129 @@ def _query_pattern() -> re.Pattern[str]:
 QUERY_PATTERN = _query_pattern()
 
 
-def _is_query_candidate(query: str, relationships: Set[str]) -> bool:
-    """Reject common non-database chains such as request()->session()->get()."""
+def _static_query_origin(query: str, model_classes: Set[str]) -> Optional[str]:
     compact = re.sub(r"\s+", "", query)
-    if re.match(r"\\?[A-Z][A-Za-z0-9_\\]*::", compact):
-        return True
-    builder_methods = (
-        "where", "orWhere", "whereIn", "whereHas", "select", "addSelect", "table",
-        "query", "join", "leftJoin", "rightJoin", "orderBy", "latest", "oldest",
-        "groupBy", "having", "limit", "take", "offset", "skip", "with", "on",
-        "from", "distinct", "lockForUpdate",
-    )
-    if any("->%s(" % name in compact for name in builder_methods):
-        return True
-    return any("->%s(" % name in compact for name in relationships)
+    for static_match in re.finditer(r"\\?([A-Z][A-Za-z0-9_\\]*)::", compact):
+        class_name = static_match.group(1).split("\\")[-1]
+        if class_name == "DB" or class_name in model_classes:
+            return class_name
+    member_static = re.search(r"\$this->([A-Za-z_][A-Za-z0-9_]*)::", compact)
+    if member_static:
+        return "$this->" + member_static.group(1)
+    return None
+
+
+def _last_assignment(method_source: str, variable: str, before: int) -> Optional[Tuple[int, str]]:
+    """Find the last simple assignment completed before an offset."""
+    masked = mask_php(method_source[:before])
+    pattern = re.compile(r"\$" + re.escape(variable) + r"\s*=\s*(?P<rhs>.*?);", re.DOTALL)
+    matches = list(pattern.finditer(masked))
+    if not matches:
+        return None
+    match = matches[-1]
+    return match.start(), method_source[match.start("rhs"):match.end("rhs")]
+
+
+def _variable_source_model(
+    method_source: str,
+    variable: str,
+    before: int,
+    model_classes: Set[str],
+    seen: Optional[Set[str]] = None,
+) -> Optional[str]:
+    """Trace a collection or builder variable back to its Eloquent model."""
+    visited = set(seen or set())
+    if variable in visited:
+        return None
+    visited.add(variable)
+    assignment = _last_assignment(method_source, variable, before)
+    if assignment is None:
+        return None
+    assignment_start, rhs = assignment
+    origin = _static_query_origin(rhs.lstrip(), model_classes)
+    if origin and origin != "DB":
+        return origin
+    source_variable = re.match(r"\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*->", rhs)
+    if source_variable:
+        return _variable_source_model(
+            method_source, source_variable.group(1), assignment_start, model_classes, visited
+        )
+    return None
+
+
+def _query_variable_origin(
+    method_source: str,
+    variable: str,
+    before: int,
+    model_classes: Set[str],
+    seen: Optional[Set[str]] = None,
+) -> Optional[str]:
+    """Trace a variable to a query builder, rejecting executed-query results."""
+    visited = set(seen or set())
+    if variable in visited:
+        return None
+    visited.add(variable)
+    assignment = _last_assignment(method_source, variable, before)
+    if assignment is None:
+        return None
+    assignment_start, rhs = assignment
+    if QUERY_PATTERN.search(mask_php(rhs)):
+        return None
+    origin = _static_query_origin(rhs.lstrip(), model_classes)
+    if origin:
+        return origin
+    source_variable = re.match(r"\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*->", rhs)
+    if source_variable:
+        return _query_variable_origin(
+            method_source, source_variable.group(1), assignment_start, model_classes, visited
+        )
+    return None
+
+
+def _query_candidate_origin(
+    query: str,
+    method_source: str,
+    offset: int,
+    model_classes: Set[str],
+    relationships: Set[str],
+) -> Optional[str]:
+    """Return a stable query origin, or None for collection/non-query chains."""
+    origin = _static_query_origin(query, model_classes)
+    if origin:
+        return origin
+    compact = re.sub(r"\s+", "", query)
+    variable_match = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)->", compact)
+    if not variable_match:
+        return None
+    variable = variable_match.group(1)
+    origin = _query_variable_origin(method_source, variable, offset, model_classes)
+    if origin:
+        return origin
+    for relationship in relationships:
+        if "->%s(" % relationship in compact:
+            return "relationship:" + relationship
+    return None
+
+
+def _foreach_model(
+    method_source: str,
+    header: str,
+    loop_start: int,
+    model_classes: Set[str],
+) -> Optional[str]:
+    iterable_match = re.search(r"\bforeach\s*\(\s*(.*?)\s+as\s+", header, re.DOTALL)
+    if not iterable_match:
+        return None
+    iterable = iterable_match.group(1).strip()
+    origin = _static_query_origin(iterable, model_classes)
+    if origin and origin != "DB":
+        return origin
+    variable_match = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)", iterable)
+    if variable_match:
+        return _variable_source_model(
+            method_source, variable_match.group(1), loop_start, model_classes
+        )
+    return None
 
 
 def _loop_ranges(method_source: str) -> List[Tuple[int, int, int, str, str]]:
@@ -317,6 +447,7 @@ class LaravelQueryScanner:
         self.relationships, self.relationships_by_model, self.relationship_signature = discover_relationships(
             self.project_root
         )
+        self.model_classes = discover_model_classes(self.project_root)
 
     @staticmethod
     def is_laravel_project(path: Path) -> bool:
@@ -389,13 +520,13 @@ class LaravelQueryScanner:
 
         for body_start, body_end, loop_start, loop_kind, header in _loop_ranges(method_source):
             loop_body = method_source[body_start:body_end]
-            query_match = next(
-                (match for match in QUERY_PATTERN.finditer(mask_php(loop_body))
-                 if _is_query_candidate(loop_body[match.start():match.end()], self.relationships)),
-                None,
-            )
-            if query_match:
+            for query_match in QUERY_PATTERN.finditer(mask_php(loop_body)):
                 offset = body_start + query_match.start()
+                query_text = loop_body[query_match.start():query_match.end()]
+                if not _query_candidate_origin(
+                    query_text, method_source, offset, self.model_classes, self.relationships
+                ):
+                    continue
                 findings.append(Finding(
                     "LQS001", "high", "high", relative,
                     method.start_line + line_number(method_source, offset) - 1,
@@ -406,12 +537,18 @@ class LaravelQueryScanner:
                 ))
 
             foreach_variable = re.search(r"\bas\s+(?:\$\w+\s*=>\s*)?\$(\w+)", header)
-            if foreach_variable and self.relationships:
+            foreach_model = _foreach_model(method_source, header, loop_start, self.model_classes)
+            model_relationships = self.relationships_by_model.get(foreach_model or "", [])
+            if foreach_variable and model_relationships:
                 variable = re.escape(foreach_variable.group(1))
-                relation_names = "|".join(re.escape(name) for name in sorted(self.relationships, key=len, reverse=True))
-                lazy_pattern = re.compile(r"\$" + variable + r"\s*->\s*(" + relation_names + r")\b(?!\s*\()")
-                lazy_match = lazy_pattern.search(loop_body)
-                if lazy_match:
+                relation_names = "|".join(
+                    re.escape(name) for name in sorted(model_relationships, key=len, reverse=True)
+                )
+                lazy_pattern = re.compile(
+                    r"\$" + variable + r"\s*->\s*(" + relation_names + r")\b"
+                    r"(?!\s*(?:\(|(?:\[[^\]]*\]\s*)?(?:=|\+=|-=|\*=|\.=)))"
+                )
+                for lazy_match in lazy_pattern.finditer(loop_body):
                     offset = body_start + lazy_match.start()
                     findings.append(Finding(
                         "LQS002", "high", "medium", relative,
@@ -450,9 +587,12 @@ class LaravelQueryScanner:
         queries: Dict[str, List[Tuple[int, str]]] = {}
         for match in QUERY_PATTERN.finditer(masked):
             query_text = method_source[match.start():match.end()]
-            if not _is_query_candidate(query_text, self.relationships):
+            origin = _query_candidate_origin(
+                query_text, method_source, match.start(), self.model_classes, self.relationships
+            )
+            if not origin:
                 continue
-            normalized = _normalize_query(query_text)
+            normalized = origin.lower() + "|" + _normalize_query(query_text)
             queries.setdefault(normalized, []).append((match.start(), query_text))
         for occurrences in queries.values():
             if len(occurrences) < 2:

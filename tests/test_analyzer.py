@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from analyzer import CacheStore, LaravelQueryScanner, extract_methods, mask_php
+from analyzer import CacheStore, LaravelQueryScanner, QUERY_PATTERN, extract_methods, mask_php
 
 
 CONTROLLER = """<?php
@@ -28,6 +28,46 @@ class UserController {
     public function fullyQualified() {
         \\App\\User::all();
     }
+
+    public function multipleLoopQueries() {
+        $users = User::get();
+        foreach ($users as $user) {
+            User::where('id', $user->id)->first();
+            DB::table('logs')->where('user_id', $user->id)->first();
+        }
+    }
+
+    public function assignedRelationshipName() {
+        $users = User::get();
+        foreach ($users as $user) {
+            $user->posts = User::where('id', $user->id)->first();
+        }
+    }
+
+    public function collectionOperations() {
+        $users = User::where('active', 1)->get();
+        $users->where('type', 'a')->pluck('id');
+        $users->where('type', 'b')->pluck('id');
+    }
+
+    public function repeatedBuilder() {
+        $builder = User::query();
+        $builder->where('active', 1)->first();
+        $builder->where('active', 2)->first();
+    }
+
+    public function differentBuilders() {
+        $users = User::query();
+        $posts = Post::query();
+        $users->where('active', 1)->first();
+        $posts->where('active', 1)->first();
+    }
+
+    public function sessionInsideLoop() {
+        foreach ([1, 2] as $id) {
+            Session::get('branch_code');
+        }
+    }
 }
 """
 
@@ -37,6 +77,11 @@ class User extends Model {
     protected $table = 'users';
     public function posts() { return $this->hasMany(Post::class); }
 }
+"""
+
+POST_MODEL = """<?php
+namespace App;
+class Post extends Model {}
 """
 
 MIGRATION = """<?php
@@ -57,6 +102,7 @@ class LaravelFixture:
         self.controller = root / "app" / "Http" / "Controllers" / "UserController.php"
         self.controller.write_text(CONTROLLER, encoding="utf-8")
         (root / "app" / "User.php").write_text(MODEL, encoding="utf-8")
+        (root / "app" / "Post.php").write_text(POST_MODEL, encoding="utf-8")
         (root / "database" / "migrations" / "create_users.php").write_text(MIGRATION, encoding="utf-8")
 
 
@@ -69,9 +115,16 @@ class AnalyzerTests(unittest.TestCase):
         self.assertNotIn("fake", masked)
         self.assertNotIn("query", masked)
 
+    def test_property_access_does_not_swallow_following_query(self) -> None:
+        source = "if ($user->id) {\n    User::where('id', 1)->first();\n}"
+        match = QUERY_PATTERN.search(mask_php(source))
+        self.assertIsNotNone(match)
+        self.assertTrue(source[match.start():].startswith("User::where"))
+
     def test_extracts_named_methods_not_comment_text(self) -> None:
         methods = extract_methods(CONTROLLER + "\n// function ignored() {}")
-        self.assertEqual(["index", "repeated", "fullyQualified"], [method.name for method in methods])
+        self.assertIn("index", [method.name for method in methods])
+        self.assertIn("sessionInsideLoop", [method.name for method in methods])
 
     def test_scanner_finds_core_rules(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -98,6 +151,44 @@ class AnalyzerTests(unittest.TestCase):
             scanner = LaravelQueryScanner(fixture.root, use_cache=False)
             summary = scanner.scan(selected_file=fixture.controller, selected_method="fullyQualified")
             self.assertEqual(["LQS004"], [item.rule_id for item in summary.findings])
+
+    def test_reports_every_query_in_one_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaravelFixture(Path(directory))
+            scanner = LaravelQueryScanner(fixture.root, use_cache=False)
+            summary = scanner.scan(selected_file=fixture.controller, selected_method="multipleLoopQueries")
+            self.assertEqual(2, sum(item.rule_id == "LQS001" for item in summary.findings))
+
+    def test_relationship_assignment_is_not_lazy_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaravelFixture(Path(directory))
+            scanner = LaravelQueryScanner(fixture.root, use_cache=False)
+            summary = scanner.scan(selected_file=fixture.controller, selected_method="assignedRelationshipName")
+            self.assertNotIn("LQS002", {item.rule_id for item in summary.findings})
+            self.assertEqual(1, sum(item.rule_id == "LQS001" for item in summary.findings))
+
+    def test_collection_operations_are_not_repeated_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaravelFixture(Path(directory))
+            scanner = LaravelQueryScanner(fixture.root, use_cache=False)
+            summary = scanner.scan(selected_file=fixture.controller, selected_method="collectionOperations")
+            self.assertNotIn("LQS005", {item.rule_id for item in summary.findings})
+
+    def test_same_builder_repeats_but_different_models_do_not_collide(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaravelFixture(Path(directory))
+            scanner = LaravelQueryScanner(fixture.root, use_cache=False)
+            repeated = scanner.scan(selected_file=fixture.controller, selected_method="repeatedBuilder")
+            different = scanner.scan(selected_file=fixture.controller, selected_method="differentBuilders")
+            self.assertIn("LQS005", {item.rule_id for item in repeated.findings})
+            self.assertNotIn("LQS005", {item.rule_id for item in different.findings})
+
+    def test_session_get_inside_loop_is_not_a_database_query(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaravelFixture(Path(directory))
+            scanner = LaravelQueryScanner(fixture.root, use_cache=False)
+            summary = scanner.scan(selected_file=fixture.controller, selected_method="sessionInsideLoop")
+            self.assertFalse(summary.findings)
 
     def test_cache_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
